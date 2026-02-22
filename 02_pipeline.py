@@ -104,6 +104,7 @@ for name, df in dfs.items():
 print("=" * 80)
 print("STANDARDIZING JOIN KEYS")
 print("=" * 80)
+#print("test")
 
 # 4.1: HRP Dataset (Humanitarian Response Plans)
 # Columns: code, internalId, startDate, endDate, planVersion, categories, locations, years, origRequirements, revisedRequirements
