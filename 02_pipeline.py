@@ -161,12 +161,12 @@ if "hno" in dfs:
         # Year
         col("sectors_description") if "sectors_description" in hno_df.columns else None,  # or from context
         
-        # Population figures
+        # Population figures - use correct HNO column names
         col("population").cast(DoubleType()),
-        col("in_need").cast(DoubleType()).alias("in_need_population"),
-        col("targeted").cast(DoubleType()).alias("targeted_beneficiaries"),
-        col("affected").cast(DoubleType()).alias("affected_population"),
-        col("reached").cast(DoubleType()).alias("reached_beneficiaries")
+        col("inneed").cast(DoubleType()).alias("inneed"),
+        col("targeted").cast(DoubleType()).alias("targeted"),
+        col("affected").cast(DoubleType()).alias("affected"),
+        col("reached").cast(DoubleType()).alias("reached")
     ).dropna(subset=["country_code"])
     
     print(f"  After standardization: {hno_prep.count():,} rows")
@@ -219,13 +219,13 @@ if "population" in dfs:
     
     # Group by country and year to get total population
     pop_agg = pop_prep.groupBy("country_code", "year").agg(
-        spark_sum("Population").alias("total_population"),
+        spark_sum("Population").alias("population"),
         col("Country").alias("country_name")  # This won't work in groupBy - need to fix
     )
     
     # Better approach: aggregate and get country name
     pop_agg = pop_prep.groupBy("country_code", "year").agg(
-        spark_sum("Population").alias("total_population")
+        spark_sum("Population").alias("population")
     )
     
     print(f"  After aggregation: {pop_agg.count():,} rows")
@@ -253,7 +253,7 @@ if "fts_incoming" in dfs:
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## Step 6: Perform LEFT JOIN - HRP as Base
+# MAGIC ## Step 6: Perform LEFT JOIN - Combine All Data Sources
 
 # COMMAND ----------
 
@@ -265,7 +265,25 @@ print("=" * 80)
 features_df = dfs["fts_requirements_prep"]
 print(f"\n1. Base table (FTS Requirements): {features_df.count():,} rows")
 
-# Join with Population data
+# Join with HNO data (for targeted, inneed population)
+# HNO may have different schema; join on country_code, cluster_code
+if "hno_prep" in dfs:
+    hno_agg = dfs["hno_prep"].groupBy("country_code", "cluster_code").agg(
+        spark_sum("targeted").alias("targeted"),
+        spark_sum("inneed").alias("inneed"),
+        spark_sum("affected").alias("affected"),
+        spark_sum("reached").alias("reached")
+    )
+    
+    # Join FTS with HNO on country + cluster
+    features_df = features_df.join(
+        hno_agg,
+        on=["country_code", "cluster_code"],
+        how="left"
+    )
+    print(f"2. After LEFT JOIN with HNO (on country + cluster): {features_df.count():,} rows")
+
+# Join with Population data (on country + year for population context)
 if "population_prep" in dfs:
     pop_agg = dfs["population_prep"]
     features_df = features_df.join(
@@ -273,7 +291,7 @@ if "population_prep" in dfs:
         on=["country_code", "year"],
         how="left"
     )
-    print(f"2. After LEFT JOIN with Population: {features_df.count():,} rows")
+    print(f"3. After LEFT JOIN with Population: {features_df.count():,} rows")
 
 # COMMAND ----------
 
@@ -286,12 +304,16 @@ print("=" * 80)
 print("HANDLING NULL VALUES")
 print("=" * 80)
 
-# Fill nulls in funding columns with 0 (assume no funding if not reported)
+# Fill nulls in funding and population columns with 0 (assume no funding/targeting if not reported)
 features_df = features_df.fillna(
     value={
         "total_funding_usd": 0.0,
         "funding_percent": 0.0,
-        "total_population": 0.0
+        "population": 0.0,
+        "targeted": 0.0,
+        "inneed": 0.0,
+        "affected": 0.0,
+        "reached": 0.0
     }
 )
 
@@ -309,46 +331,144 @@ for col_name, null_count in sorted(null_before.items(), key=lambda x: x[1], reve
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## Step 8: Engineer Features
+# MAGIC ## Step 8: Engineer Project-Level Features (Revised)
 
 # COMMAND ----------
 
 print("=" * 80)
-print("ENGINEERING FEATURES")
+print("ENGINEERING PROJECT-LEVEL FEATURES (IMPACT-FOCUSED)")
 print("=" * 80)
 
-# Add key features for anomaly detection and benchmarking
-
+# Revised features based on targeted beneficiaries and people in need
 features_df = features_df.withColumn(
-    "beneficiary_to_budget_ratio",
-    col("total_requirements_usd") / (col("total_funding_usd") + lit(1e-9))
+    # Core efficiency signal: beneficiaries per dollar funded
+    "beneficiary_to_funding_ratio",
+    col("targeted") / (col("total_funding_usd") + lit(1e-9))
 ).withColumn(
+    # Scale signal: people in need per dollar requested
+    "need_to_requirements_ratio",
+    col("inneed") / (col("total_requirements_usd") + lit(1e-9))
+).withColumn(
+    # Prioritization signal: what % of people in need are being targeted
+    "targeting_coverage_rate",
+    col("targeted") / (col("inneed") + lit(1e-9))
+).withColumn(
+    # Raw dollar gap
     "funding_gap_usd",
     col("total_requirements_usd") - col("total_funding_usd")
 ).withColumn(
+    # % of requirements unfunded, null-safe
     "funding_gap_pct",
-    (col("total_requirements_usd") - col("total_funding_usd")) / (col("total_requirements_usd") + lit(1e-9)) * 100
+    when(col("total_requirements_usd") > 0,
+        (col("total_requirements_usd") - col("total_funding_usd"))
+        / col("total_requirements_usd") * 100
+    ).otherwise(lit(None))
 ).withColumn(
-    "cost_per_beneficiary",
+    # Fraction of requirements actually funded
+    "funding_coverage_rate",
     col("total_funding_usd") / (col("total_requirements_usd") + lit(1e-9))
-)
-
-# Additional features
-features_df = features_df.withColumn(
-    "funding_efficiency",
-    col("funding_percent") / lit(100.0)
 ).withColumn(
-    "unmet_need_rate",
-    (col("total_requirements_usd") - col("total_funding_usd")) / col("total_requirements_usd")
+    # Cost per targeted beneficiary
+    "cost_per_beneficiary",
+    when(col("targeted") > 0,
+        col("total_funding_usd") / col("targeted")
+    ).otherwise(lit(None))
 )
 
 print("✓ Features engineered:")
-print("  • beneficiary_to_budget_ratio")
-print("  • funding_gap_usd")
-print("  • funding_gap_pct")
-print("  • cost_per_beneficiary")
-print("  • funding_efficiency")
-print("  • unmet_need_rate")
+print("  • beneficiary_to_funding_ratio      — targeted people per dollar funded (efficiency)")
+print("  • need_to_requirements_ratio        — people in need per dollar requested (scale)")
+print("  • targeting_coverage_rate           — % of people in need being targeted (prioritization)")
+print("  • funding_gap_usd                   — absolute dollar shortfall")
+print("  • funding_gap_pct                   — % of need unfunded")
+print("  • funding_coverage_rate             — fraction of requirements funded (0-1)")
+print("  • cost_per_beneficiary              — USD per targeted beneficiary")
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## Step 8b: Engineer Population-Based Features
+
+# COMMAND ----------
+
+print("=" * 80)
+print("ENGINEERING POPULATION-BASED FEATURES")
+print("=" * 80)
+
+# Population-relative metrics (context features showing project scale vs. country size)
+features_df = features_df.withColumn(
+    "cost_per_capita",
+    col("total_funding_usd") / (col("population") + lit(1e-9))
+).withColumn(
+    "requirement_per_capita",
+    col("total_requirements_usd") / (col("population") + lit(1e-9))
+).withColumn(
+    "funding_coverage_pct",
+    (col("total_funding_usd") / (col("population") + lit(1e-9))) * 100
+).withColumn(
+    "requirement_coverage_pct",
+    (col("total_requirements_usd") / (col("population") + lit(1e-9))) * 100
+)
+
+print("✓ Population-based features engineered:")
+print("  • cost_per_capita (funded spend per person)")
+print("  • requirement_per_capita (required spend per person)")
+print("  • funding_coverage_pct (funded spend as % of population)")
+print("  • requirement_coverage_pct (required spend as % of population)")
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## Step 8c: Engineer Sector-Based Features
+
+# COMMAND ----------
+
+print("=" * 80)
+print("ENGINEERING SECTOR-BASED FEATURES")
+print("=" * 80)
+
+# Create sector-level aggregations (window functions)
+from pyspark.sql.window import Window
+
+# Define window for sector + year aggregations
+sector_window = Window.partitionBy("country_code", "year", "cluster_code")
+
+# Sector totals and metrics
+features_df = features_df.withColumn(
+    "sector_total_requirements_usd",
+    spark_sum("total_requirements_usd").over(sector_window)
+).withColumn(
+    "sector_total_funding_usd",
+    spark_sum("total_funding_usd").over(sector_window)
+).withColumn(
+    "sector_total_gap_usd",
+    spark_sum("funding_gap_usd").over(sector_window)
+).withColumn(
+    "sector_project_count",
+    count("appeal_id").over(sector_window)
+).withColumn(
+    "project_funding_share_of_sector_pct",
+    (col("total_funding_usd") / (col("sector_total_funding_usd") + lit(1e-9))) * 100
+).withColumn(
+    "project_requirement_share_of_sector_pct",
+    (col("total_requirements_usd") / (col("sector_total_requirements_usd") + lit(1e-9))) * 100
+).withColumn(
+    "sector_funding_efficiency_pct",
+    (col("sector_total_funding_usd") / (col("sector_total_requirements_usd") + lit(1e-9))) * 100
+).withColumn(
+    "project_funding_status_vs_sector_avg",
+    col("funding_percent") - (col("sector_total_funding_usd") / (col("sector_total_requirements_usd") + lit(1e-9))) * 100
+)
+
+print("✓ Sector-based features engineered:")
+print("  • sector_total_requirements_usd (total needs in this sector)")
+print("  • sector_total_funding_usd (total funding received by sector)")
+print("  • sector_total_gap_usd (total funding gap in sector)")
+print("  • sector_project_count (number of projects in sector)")
+print("  • project_funding_share_of_sector_pct (this project's funding % of sector total)")
+print("  • project_requirement_share_of_sector_pct (this project's needs % of sector total)")
+print("  • sector_funding_efficiency_pct (sector-wide funding rate)")
+print("  • project_funding_status_vs_sector_avg (how this project compares to sector average)")
 
 # COMMAND ----------
 
@@ -370,7 +490,9 @@ print(f"Total columns: {len(features_df.columns)}")
 # Nulls in key columns
 key_columns = [
     "country_code", "year", "cluster_code", "total_requirements_usd", 
-    "total_funding_usd", "funding_gap_pct", "cost_per_beneficiary"
+    "total_funding_usd", "funding_gap_pct", "cost_per_beneficiary",
+    "targeted", "inneed", "population", 
+    "sector_total_funding_usd", "sector_project_count"
 ]
 
 null_counts = features_df.select([
@@ -384,16 +506,57 @@ for col_name, null_count in null_counts.items():
     print(f"  {col_name}: {null_count:,} ({null_pct:.1f}%)")
 
 # Stats on feature columns
-print("\nFeature Statistics:")
-numeric_features = [
-    "beneficiary_to_budget_ratio",
+print("\nFeature Statistics (Project-Level - Impact Focused):")
+numeric_features_project = [
+    "beneficiary_to_funding_ratio",
+    "need_to_requirements_ratio",
+    "targeting_coverage_rate",
     "funding_gap_pct",
-    "cost_per_beneficiary",
-    "funding_efficiency",
-    "unmet_need_rate"
+    "funding_coverage_rate",
+    "cost_per_beneficiary"
 ]
 
-for col_name in numeric_features:
+for col_name in numeric_features_project:
+    try:
+        stats = features_df.select(
+            spark_min(col(col_name)).alias("min"),
+            spark_max(col(col_name)).alias("max"),
+            avg(col(col_name)).alias("avg")
+        ).collect()[0]
+        print(f"  {col_name}:")
+        print(f"    Min: {stats['min']:.4f}, Max: {stats['max']:.4f}, Avg: {stats['avg']:.4f}")
+    except:
+        print(f"  {col_name}: unable to compute")
+
+print("\nFeature Statistics (Population-Based):")
+numeric_features_pop = [
+    "cost_per_capita",
+    "requirement_per_capita",
+    "funding_coverage_pct",
+    "requirement_coverage_pct"
+]
+
+for col_name in numeric_features_pop:
+    try:
+        stats = features_df.select(
+            spark_min(col(col_name)).alias("min"),
+            spark_max(col(col_name)).alias("max"),
+            avg(col(col_name)).alias("avg")
+        ).collect()[0]
+        print(f"  {col_name}:")
+        print(f"    Min: {stats['min']:.4f}, Max: {stats['max']:.4f}, Avg: {stats['avg']:.4f}")
+    except:
+        print(f"  {col_name}: unable to compute")
+
+print("\nFeature Statistics (Sector-Based):")
+numeric_features_sector = [
+    "project_funding_share_of_sector_pct",
+    "project_requirement_share_of_sector_pct",
+    "sector_funding_efficiency_pct",
+    "project_funding_status_vs_sector_avg"
+]
+
+for col_name in numeric_features_sector:
     try:
         stats = features_df.select(
             spark_min(col(col_name)).alias("min"),
@@ -489,18 +652,40 @@ print("  1. Loaded raw Delta tables from Notebook 01")
 print("  2. Standardized join keys (country_code, year, cluster_code)")
 print("  3. Performed LEFT JOINs: FTS Requirements + Population")
 print("  4. Handled nulls: filled funding with 0, preserved key columns")
-print("  5. Engineered features:")
-print("     - beneficiary_to_budget_ratio (for scale analysis)")
-print("     - funding_gap_usd & funding_gap_pct (for financing gaps)")
-print("     - cost_per_beneficiary (for efficiency analysis)")
-print("     - funding_efficiency (funding_percent / 100)")
-print("     - unmet_need_rate (gap / requirements)")
-print("  6. Written final dataset to humanitarian.features Delta table")
+print("\n  5. ENGINEERED PROJECT-LEVEL FEATURES (Impact-Focused):")
+print("     - beneficiary_to_funding_ratio (efficiency: targeted people per dollar)")
+print("     - need_to_requirements_ratio (scale: need per dollar requested)")
+print("     - targeting_coverage_rate (prioritization: % of need being addressed)")
+print("     - funding_gap_usd & funding_gap_pct (absolute and % financing gaps)")
+print("     - funding_coverage_rate (% of requirements met)")
+print("     - cost_per_beneficiary (USD per targeted person)")
+print("\n  6. ENGINEERED POPULATION-BASED FEATURES (Context):")
+print("     - cost_per_capita (funded spend per person)")
+print("     - requirement_per_capita (required spend per person)")
+print("     - funding_coverage_pct (funded spend as % of population)")
+print("     - requirement_coverage_pct (required spend as % of population)")
+print("\n  7. ENGINEERED SECTOR-BASED FEATURES (Benchmarking):")
+print("     - sector_total_requirements_usd (total needs in sector)")
+print("     - sector_total_funding_usd (total sector funding)")
+print("     - sector_total_gap_usd (total sector gap)")
+print("     - sector_project_count (# projects in sector)")
+print("     - project_funding_share_of_sector_pct (project's % of sector funding)")
+print("     - project_requirement_share_of_sector_pct (project's % of sector needs)")
+print("     - sector_funding_efficiency_pct (sector-wide funding rate)")
+print("     - project_funding_status_vs_sector_avg (vs. sector benchmark)")
+print("\n  8. Written final dataset to humanitarian.features Delta table")
+
+print("\n✓ FEATURE SUMMARY:")
+print("  • Total features: 22 (project, population, sector-based)")
+print("  • IMPACT-FOCUSED: beneficiary_to_funding_ratio, targeting_coverage_rate")
+print("  • Can use for anomaly detection (Notebook 03)")
+print("  • Can use for benchmarking/clustering (Notebook 04)")
+print("  • Can use for optimization (Notebook 05)")
 
 print("\n✓ NEXT STEPS:")
 print("  → Proceed to Notebook 03 (Anomaly Detection)")
-print("  → Use the 'features' table as input for anomaly detection")
-print("  → Focus features: beneficiary_to_budget_ratio, funding_gap_pct, cost_per_beneficiary")
+print("  → Use impact-focused features for benefit/cost efficiency analysis")
+print("  → Apply sector-based context for comparative anomalies")
 
 # COMMAND ----------
 
